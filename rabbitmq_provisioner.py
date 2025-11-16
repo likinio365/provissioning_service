@@ -25,46 +25,47 @@ logger = logging.getLogger(__name__)
 def _make_api_call(method, endpoint, json_data=None):
     """Generic function to handle RabbitMQ API calls with exponential backoff."""
     url = f"{RABBITMQ_HOST}{endpoint}"
-    # This is where the authentication happens using the ADMIN credentials
     auth = (ADMIN_USERNAME, ADMIN_PASSWORD)
-    
-    # Simple retry logic for reliability
+
     max_retries = 3
     for attempt in range(max_retries):
         try:
             response = requests.request(method, url, auth=auth, json=json_data, timeout=10)
-            response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
+            response.raise_for_status()
             return response
         except requests.exceptions.HTTPError as e:
-            # Handle specific RabbitMQ errors (e.g., user already exists)
-            logger.error(f"HTTP Error on {method} {endpoint} (Attempt {attempt+1}): {e} - Response: {response.text}")
+            logger.error(
+                f"HTTP Error on {method} {endpoint} (Attempt {attempt+1}): {e} - Response: {response.text}"
+            )
+
             if response.status_code in [401, 403]:
-                # If the ADMIN user is unauthorized, we stop immediately.
-                logger.error("Authentication check failed. Please verify ADMIN_USERNAME and ADMIN_PASSWORD.")
-                return None 
+                logger.error("Authentication check failed. Verify ADMIN_USERNAME and ADMIN_PASSWORD.")
+                return None
+
             if attempt == max_retries - 1:
                 return None
+
         except requests.exceptions.RequestException as e:
             logger.error(f"Connection Error on {method} {endpoint} (Attempt {attempt+1}): {e}")
             if attempt == max_retries - 1:
                 return None
-        
-        sleep(2 ** attempt) # Exponential backoff
+
+        sleep(2 ** attempt)
+
     return None
+
 
 def check_developer_config_rights(requester_username, target_vhost):
     """
     Checks if the developer has config rights on the target vhost.
-    The permission check must be based on the permissions assigned to the developer user.
     """
     logger.info(f"Checking config rights for {requester_username} on vhost /{target_vhost}...")
-    
-    # Endpoint to get all permissions for the requester
+
     endpoint = f"/api/users/{requester_username}/permissions"
     response = _make_api_call("GET", endpoint)
 
     if response is None:
-        logger.error(f"Failed to retrieve permissions for {requester_username}. API call failed.")
+        logger.error(f"Failed to retrieve permissions for {requester_username}.")
         return False
 
     try:
@@ -73,91 +74,121 @@ def check_developer_config_rights(requester_username, target_vhost):
         logger.error(f"Failed to decode permissions response for {requester_username}.")
         return False
 
-    # Find the permission object for the specific vhost
     vhost_permission = next((p for p in permissions if p['vhost'] == target_vhost), None)
 
     if not vhost_permission:
-        logger.warning(f"Developer {requester_username} has no defined permissions on vhost /{target_vhost}.")
+        logger.warning(f"Developer {requester_username} has no permissions on vhost /{target_vhost}.")
         return False
 
-    # Check the 'configure' regex. It should be non-empty (e.g., ".*")
     config_regex = vhost_permission.get('configure')
-    
+
     if config_regex and config_regex.strip():
-        logger.info(f"Developer {requester_username} is authorized. Config regex: '{config_regex}'")
+        logger.info(f"Developer {requester_username} authorized (configure regex: '{config_regex}').")
         return True
     else:
-        logger.warning(f"Developer {requester_username} is NOT authorized. Configure regex is empty or null.")
+        logger.warning(f"Developer {requester_username} NOT authorized. Empty configure regex.")
         return False
+
+
+def _authenticate_requester(requester_username, requester_password):
+    """
+    Uses /api/whoami to verify that the requester provided the correct password.
+    """
+    logger.info(f"Authenticating requester {requester_username}...")
+
+    try:
+        response = requests.get(
+            f"{RABBITMQ_HOST}/api/whoami",
+            auth=(requester_username, requester_password),
+            timeout=10
+        )
+    except Exception as e:
+        logger.error(f"AUTHENTICATION FAILED: Error contacting RabbitMQ for requester auth: {e}")
+        return False
+
+    if response.status_code in [200]:
+        logger.info("Requester authentication successful.")
+        return True
+
+    logger.error(
+        f"AUTHENTICATION FAILED: Invalid password for user '{requester_username}'. Status {response.status_code}"
+    )
+    return False
+
 
 def provision_user(request_data: dict):
     """
-    Main provisioning function that orchestrates the workflow.
-    It expects a dictionary payload mirroring a service request containing all necessary fields.
+    Main provisioning workflow.
     """
-    # Extract data from the request payload. The service expects all fields explicitly.
     try:
         requester_username = request_data['requester_username']
-        target_vhost = request_data['target_host'] # Matches user's required field name
-        new_app_username = request_data['username'] # Matches user's required field name
-        new_password = request_data['password'] # Matches user's required field name
-        
-        # Developer provides the specific read/write permissions regexes
+        requester_password = request_data['requester_password']  # NEW
+        target_vhost = request_data['target_host']
+        new_app_username = request_data['username']
+        new_password = request_data['password']
+
         permissions_data = request_data['permissions']
         configure_regex = permissions_data['configure']
         read_regex = permissions_data['read']
         write_regex = permissions_data['write']
-        
-        new_queue_name = request_data['new_queue_name'] # Matches user's required field name
+
+        new_queue_name = request_data['new_queue_name']
+
+        user_tags = request_data.get("tags", "management")
+
     except KeyError as e:
         error_msg = f"MALFORMED REQUEST: Missing mandatory field: {e}"
         logger.error(error_msg)
         return False, error_msg
 
-
     logger.info(f"--- Provisioning Request for VHost: /{target_vhost} ---")
     logger.info(f"Requester: {requester_username}, New User: {new_app_username}, Queue: {new_queue_name}")
 
-    # 1. CRITICAL CHECK: Verify developer's config rights
+    # 0. Authenticate requester password
+    if not _authenticate_requester(requester_username, requester_password):
+        error_msg = f"AUTHENTICATION FAILED: Invalid password for requester '{requester_username}'."
+        return False, error_msg
+
+    # 1. Check config rights
     if not check_developer_config_rights(requester_username, target_vhost):
-        error_msg = f"AUTHORIZATION FAILED: {requester_username} is not permitted to provision resources on vhost /{target_vhost}."
+        error_msg = f"AUTHORIZATION FAILED: {requester_username} cannot provision vhost /{target_vhost}."
         logger.error(error_msg)
         return False, error_msg
 
-    # 2. Create the new application user
+    # 2. Create application user
     logger.info(f"Creating user {new_app_username}...")
     user_endpoint = f"/api/users/{new_app_username}"
-    # Using 'app_user' tag for the application user
-    #user_data = {"password": new_password, "tags": "management"}
-    user_tags = request_data.get("tags", "management")  # default to 'app_user' if not provided
     user_data = {"password": new_password, "tags": user_tags}
+
     user_response = _make_api_call("PUT", user_endpoint, user_data)
-    
+
     if user_response is None:
-        return False, f"Failed to create user {new_app_username}. Check logs for details."
-    
-    # NOTE: We do not need to create the queue, as RabbitMQ allows binding to non-existent queues,
-    # and the app user will declare it upon first connection.
+        return False, f"Failed to create user {new_app_username}. See logs."
 
-    logger.info(f"User {new_app_username} created successfully (or already exists).")
+    logger.info(f"User {new_app_username} created or already exists.")
 
-    # 3. Set fine-grained permissions for the new user
-    # The new user gets READ/WRITE based on developer input, but CONFIG rights are ZEROED OUT for security.
+    # 3. Set permissions
     logger.info(f"Setting permissions for {new_app_username} on vhost /{target_vhost}...")
     perms_endpoint = f"/api/permissions/{target_vhost}/{new_app_username}"
-    
+
     perms_data = {
-        "configure": configure_regex,  
-        "write": write_regex,      
-        "read": read_regex         
+        "configure": configure_regex,
+        "write": write_regex,
+        "read": read_regex
     }
-    
+
     perms_response = _make_api_call("PUT", perms_endpoint, perms_data)
 
     if perms_response is None:
-        # A full service would include cleanup logic (e.g., deleting the user if permission setting failed).
-        return False, f"Failed to set permissions for {new_app_username} on vhost /{target_vhost}. Cleanup needed."
+        return False, (
+            f"Failed to set permissions for {new_app_username} on vhost /{target_vhost}. "
+            "Cleanup may be required."
+        )
 
-    logger.info(f"Permissions set successfully: Configure regex '{configure_regex}' , Read regex '{read_regex}', Write regex '{write_regex}'.")
+    logger.info(f"Permissions applied: configure='{configure_regex}', read='{read_regex}', write='{write_regex}'.")
 
-    return True, f"SUCCESS: User {new_app_username} created with permissions on vhost /{target_vhost} for queue '{new_queue_name}'."
+    return True, (
+        f"SUCCESS: User {new_app_username} created with permissions on vhost /{target_vhost} "
+        f"for queue '{new_queue_name}'."
+    )
+
